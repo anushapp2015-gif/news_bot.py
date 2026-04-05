@@ -1,0 +1,28 @@
+name: News Bot
+
+on:
+  schedule:
+    - cron: '30 0 * * *'
+    - cron: '30 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install feedparser supabase google-generativeai requests
+
+      - name: Run news bot
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GEMINI_KEY:   ${{ secrets.GEMINI_KEY }}
+          PEXELS_KEY:   ${{ secrets.PEXELS_KEY }}
+        run: python news_bot.py
