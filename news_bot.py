@@ -1,167 +1,218 @@
-import feedparser, requests, os, json
+import os, time, uuid, tempfile, requests
+from datetime import datetime, timezone
 from supabase import create_client
 import google.generativeai as genai
+import feedparser
+from urllib.parse import quote
 
-# --- Secrets from GitHub Actions ---
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-GEMINI_KEY   = os.environ["GEMINI_KEY"]
-PEXELS_KEY   = os.environ["PEXELS_KEY"]
+# --- Secrets ---
+SUPABASE_URL    = os.environ["SUPABASE_URL"]
+SUPABASE_KEY    = os.environ["SUPABASE_KEY"]
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "news-images")
+GEMINI_KEY      = os.environ["GEMINI_KEY"]
+TABLE_NAME      = "news"
 
+# --- Init ---
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 genai.configure(api_key=GEMINI_KEY)
 model = genai.GenerativeModel("gemini-1.5-flash")
 
-# --- Your exact category names as seen in table ---
-TOPICS = {
-    "India":    "https://news.google.com/rss/search?q=india+news&hl=en-IN&gl=IN&ceid=IN:en",
-    "TS/AP":    "https://news.google.com/rss/search?q=telangana+OR+andhra+pradesh&hl=en-IN&gl=IN&ceid=IN:en",
-    "Sports":   "https://news.google.com/rss/search?q=india+sports&hl=en-IN&gl=IN&ceid=IN:en",
-    "Cinema":   "https://news.google.com/rss/search?q=bollywood+OR+tollywood&hl=en-IN&gl=IN&ceid=IN:en",
-    "Business": "https://news.google.com/rss/search?q=india+business+economy&hl=en-IN&gl=IN&ceid=IN:en",
+# --- Google News RSS per category ---
+CATEGORY_FEEDS = {
+    "TS/AP": [
+        "https://news.google.com/rss/search?q=telangana&hl=en-IN&gl=IN&ceid=IN:en",
+        "https://news.google.com/rss/search?q=andhra+pradesh&hl=en-IN&gl=IN&ceid=IN:en",
+    ],
+    "India":         ["https://news.google.com/rss/search?q=india+news&hl=en-IN&gl=IN&ceid=IN:en"],
+    "Sports":        ["https://news.google.com/rss/search?q=india+sports&hl=en-IN&gl=IN&ceid=IN:en"],
+    "Entertainment": ["https://news.google.com/rss/search?q=bollywood+tollywood+cinema&hl=en-IN&gl=IN&ceid=IN:en"],
+    "Business":      ["https://news.google.com/rss/search?q=india+business+economy&hl=en-IN&gl=IN&ceid=IN:en"],
 }
 
-# --- Safe keywords filter for kids ---
-BLOCKED = [
-    "murder","killed","rape","assault","stab","dead body","suicide",
-    "attack","bomb","terrorist","molest","abduct","kidnap","robbery",
-    "shoot","gun","massacre","riot","blast","explosion","arson",
-    "death toll","fatality","accident","crash","fire"
+# --- Violence filter ---
+FORBIDDEN_WORDS = [
+    "rape", "murder", "kill", "suicide", "violence", "dead", "dies",
+    "shot", "stab", "assault", "blast", "bomb", "terror", "kidnap",
+    "robbery", "massacre", "riot", "arson", "hostage", "execution"
 ]
 
-def is_safe(title: str) -> bool:
-    t = title.lower()
-    return not any(word in t for word in BLOCKED)
-
-def get_source_name(entry) -> str:
-    # Google News RSS puts source in 'source' tag or title after " - "
-    if hasattr(entry, 'source') and hasattr(entry.source, 'title'):
-        return entry.source.title[:50]  # truncate to fit column
-    title = entry.get("title", "")
-    if " - " in title:
-        return title.split(" - ")[-1].strip()[:50]
-    return "News Bot"
+def is_violent(text):
+    if not text:
+        return False
+    lower = text.lower()
+    return any(word in lower for word in FORBIDDEN_WORDS)
 
 def clean_title(raw_title: str) -> str:
-    # Remove "Source Name - " suffix that Google News adds
+    # Google News appends " - Source Name" — remove it
     if " - " in raw_title:
         return raw_title.rsplit(" - ", 1)[0].strip()
     return raw_title.strip()
 
-def fetch_top_articles(feed_url: str, limit: int = 8) -> list:
-    feed = feedparser.parse(feed_url)
-    safe = [e for e in feed.entries if is_safe(e.get("title", ""))]
-    return safe[:limit]
+def get_source_name(entry) -> str:
+    if hasattr(entry, "source") and hasattr(entry.source, "title"):
+        return entry.source.title[:80]
+    title = entry.get("title", "")
+    if " - " in title:
+        return title.rsplit(" - ", 1)[-1].strip()
+    return "Google News"
 
+def fetch_articles(feed_url: str, limit: int = 8) -> list:
+    try:
+        feed = feedparser.parse(feed_url)
+        safe = [e for e in feed.entries if not is_violent(e.get("title", ""))]
+        return safe[:limit]
+    except Exception as e:
+        print(f"  ⚠️ RSS fetch failed: {e}")
+        return []
+
+# --- Gemini: summary + vocab + image prompt ---
 def ai_process(title: str, raw_summary: str) -> dict:
-    prompt = f"""
-You are writing news for Indian school kids aged 10-14.
+    prompt = f"""You are writing news for Indian school kids aged 10-14.
 
 Original headline: {title}
 Original text: {raw_summary}
 
-Return ONLY valid JSON (no markdown backticks, no explanation):
+Return ONLY valid JSON (no markdown, no backticks):
 {{
-  "headline": "Simple rewritten headline in 10-12 words, present tense, easy English",
-  "content": "Write exactly 3 sentences about this news in very simple English for kids. Be factual and educational.",
-  "vocab1_word": "One interesting word from this topic (not too basic)",
-  "vocab1_meaning": "One simple sentence explaining the word for a 12-year-old",
-  "vocab2_word": "A second useful word from this topic",
-  "vocab2_meaning": "One simple sentence explaining the word for a 12-year-old"
-}}
-"""
-    resp = model.generate_content(prompt)
-    text = resp.text.strip()
-    # Clean any markdown fences if Gemini adds them
-    text = text.replace("```json", "").replace("```", "").strip()
-    return json.loads(text)
+  "headline": "Simple rewritten headline in 10-12 words, present tense",
+  "content": "3 simple sentences explaining this news for kids. Factual and educational.",
+  "vocab": "word1 – meaning1,,word2 – meaning2",
+  "image_prompt": "A colorful, friendly, cartoon-style illustration for this news. Safe for kids. No text in image. Max 15 words."
+}}"""
 
-def format_vocabulary(data: dict) -> str:
-    # Stored in your single 'vocabulary' text column
-    return (
-        f"📘 {data['vocab1_word']}: {data['vocab1_meaning']}  |  "
-        f"📗 {data['vocab2_word']}: {data['vocab2_meaning']}"
-    )
+    for attempt in range(3):
+        try:
+            resp = model.generate_content(prompt)
+            text = resp.text.strip().replace("```json","").replace("```","").strip()
+            import json
+            return json.loads(text)
+        except Exception as e:
+            print(f"  ⚠️ Gemini error (attempt {attempt+1}/3): {e}")
+            time.sleep(3)
 
-def fetch_image(keyword: str) -> str:
+    # Fallback
+    return {
+        "headline": title,
+        "content": raw_summary[:200],
+        "vocab": "",
+        "image_prompt": f"colorful cartoon illustration about {title[:40]}"
+    }
+
+# --- Generate AI image via Pollinations.ai (FREE, no key needed) ---
+def generate_ai_image(prompt: str, category: str) -> str:
     try:
-        url = f"https://api.pexels.com/v1/search?query={keyword}&per_page=5&orientation=landscape"
-        headers = {"Authorization": PEXELS_KEY}
-        r = requests.get(url, headers=headers, timeout=10).json()
-        photos = r.get("photos", [])
-        if photos:
-            # Pick medium size — good balance for mobile apps
-            return photos[0]["src"]["large"]
+        # Make prompt safe and kid-friendly
+        safe_prompt = f"colorful cartoon illustration, kid friendly, {prompt}, bright colors, no text, flat design"
+        encoded     = quote(safe_prompt)
+        # Pollinations free AI image API
+        image_url   = f"https://image.pollinations.ai/prompt/{encoded}?width=800&height=450&nologo=true"
+
+        # Download the generated image
+        response = requests.get(image_url, timeout=30)
+        response.raise_for_status()
+
+        # Upload to YOUR Supabase storage bucket
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            tmp.write(response.content)
+            tmp_path = tmp.name
+
+        file_name = f"news_images/{uuid.uuid4()}.jpg"
+        supabase.storage.from_(SUPABASE_BUCKET).upload(file_name, tmp_path)
+
+        public_url = (
+            f"{SUPABASE_URL}/storage/v1/object/public/"
+            f"{SUPABASE_BUCKET}/{file_name}"
+        )
+        print(f"  🎨 AI image generated & uploaded")
+        return public_url
+
     except Exception as e:
-        print(f"  Image fetch error: {e}")
-    return ""
+        print(f"  ⚠️ AI image failed: {e}")
+        # Category fallback if generation fails
+        FALLBACKS = {
+            "India":         "https://image.pollinations.ai/prompt/colorful+map+of+india+cartoon+style+kids+friendly?width=800&height=450&nologo=true",
+            "TS/AP":         "https://image.pollinations.ai/prompt/telangana+andhra+pradesh+colorful+cartoon+landscape?width=800&height=450&nologo=true",
+            "Sports":        "https://image.pollinations.ai/prompt/kids+playing+cricket+football+colorful+cartoon?width=800&height=450&nologo=true",
+            "Entertainment": "https://image.pollinations.ai/prompt/colorful+movie+stage+lights+cartoon+style+kids?width=800&height=450&nologo=true",
+            "Business":      "https://image.pollinations.ai/prompt/colorful+cartoon+coins+charts+piggy+bank+kids?width=800&height=450&nologo=true",
+        }
+        return FALLBACKS.get(category, "https://placehold.co/800x450?text=News")
 
+# --- Main ---
 def run():
-    print("=== News Bot Starting ===")
+    print("=== News Bot Starting ===\n")
+    all_articles = []
 
-    for category, feed_url in TOPICS.items():
-        print(f"\n── [{category}]")
-        articles = fetch_top_articles(feed_url, limit=8)
+    for category, feed_urls in CATEGORY_FEEDS.items():
+        print(f"── [{category}]")
+        collected = 0
 
-        if not articles:
-            print("  No safe articles found, skipping.")
-            continue
-
-        saved = 0
-        for article in articles:
-            if saved >= 2:
+        for feed_url in feed_urls:
+            if collected >= 2:
                 break
-            try:
-                raw_title   = clean_title(article.get("title", ""))
-                raw_summary = article.get("summary", raw_title)[:800]
-                share_url   = article.get("link", "")
-                source_name = get_source_name(article)
 
-                print(f"  → {raw_title[:65]}...")
+            articles = fetch_articles(feed_url, limit=8)
 
-                # AI: rewrite + vocabulary
+            for entry in articles:
+                if collected >= 2:
+                    break
+
+                raw_title   = clean_title(entry.get("title", ""))
+                raw_summary = entry.get("summary", raw_title)[:800]
+                share_url   = entry.get("link", "")
+                source_name = get_source_name(entry)
+
+                if is_violent(raw_summary):
+                    print(f"  🚫 Filtered: {raw_title[:60]}")
+                    continue
+
+                print(f"  → {raw_title[:70]}")
+
+                # Gemini: rewrite + vocab + image prompt
                 data = ai_process(raw_title, raw_summary)
 
-                # Vocabulary formatted for your column
-                vocabulary = format_vocabulary(data)
+                # Pollinations: generate AI image
+                image_url = generate_ai_image(data["image_prompt"], category)
 
-                # Image from Pexels
-                image_url = fetch_image(category.lower().replace("/", " "))
-
-                # Insert — matching YOUR exact column names
-                supabase.table("news").insert({
+                all_articles.append({
                     "category":   category,
                     "headline":   data["headline"],
                     "content":    data["content"],
-                    "vocabulary": vocabulary,
+                    "vocabulary": data["vocab"],
                     "image_url":  image_url,
-                    "source":     source_name,
                     "share_url":  share_url,
+                    "source":     source_name,
                     "edited_by":  "news_bot",
-                }).execute()
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                })
 
-                saved += 1
-                print(f"  ✓ [{saved}/2] {data['headline']}")
+                collected += 1
+                print(f"  ✓ [{collected}/2] {data['headline'][:65]}")
+                time.sleep(3)  # avoid rate limits
 
-            except json.JSONDecodeError as e:
-                print(f"  ✗ Gemini returned invalid JSON: {e}")
-                continue
-            except Exception as e:
-                print(f"  ✗ Error: {e}")
-                continue
+        print(f"  Done — {collected} articles\n")
 
-        print(f"  Done — {saved} articles saved")
+    if not all_articles:
+        print("❌ No articles found.")
+        return
 
-    # Clean up articles older than 7 days
+    # Delete old → insert fresh
+    print("🗑️  Clearing old news...")
     try:
-        from datetime import datetime, timedelta, timezone
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-        supabase.table("news").delete().lt("created_at", cutoff).execute()
-        print("\n✓ Old articles cleaned up (>7 days)")
+        supabase.table(TABLE_NAME).delete().neq("id", 0).execute()
+        print("✓ Cleared\n")
     except Exception as e:
-        print(f"\n  Cleanup skipped: {e}")
+        print(f"  ⚠️ Clear failed: {e}")
 
-    print("\n=== Done ===")
+    print("📥 Inserting new articles...")
+    for article in all_articles:
+        try:
+            supabase.table(TABLE_NAME).insert(article).execute()
+            print(f"  ✅ [{article['category']}] {article['headline'][:65]}")
+        except Exception as e:
+            print(f"  ❌ Insert failed: {e}")
+
+    print(f"\n=== Done — {len(all_articles)} articles saved ===")
 
 if __name__ == "__main__":
     run()
