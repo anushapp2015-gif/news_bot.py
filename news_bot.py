@@ -8,7 +8,7 @@ from urllib.parse import quote
 # --- Secrets ---
 SUPABASE_URL    = os.environ["SUPABASE_URL"]
 SUPABASE_KEY    = os.environ["SUPABASE_KEY"]
-SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "news-images")
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "NewsImages")
 GEMINI_KEY      = os.environ["GEMINI_KEY"]
 TABLE_NAME      = "news"
 
