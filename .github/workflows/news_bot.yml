@@ -29,3 +29,6 @@ jobs:
           SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
           GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
         run: python news_bot.py
+      - name: Install dependencies
+        run: |
+          pip install supabase google-generativeai requests beautifulsoup4 feedparser
